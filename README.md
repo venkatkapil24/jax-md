@@ -44,6 +44,8 @@ See [FEATURES.md](FEATURES.md) for a tour of the main library components.
 
 ## Installation
 
+### With uv
+
 We recommend using [uv](https://docs.astral.sh/uv/) for local development:
 
 ```sh
@@ -57,6 +59,8 @@ To include testing and documentation dependencies:
 ```sh
 uv sync --no-default-groups --group testing --group docs
 ```
+
+### With pip
 
 If you want to use pip instead, install the latest published release with:
 
