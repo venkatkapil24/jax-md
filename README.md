@@ -88,8 +88,24 @@ JAX MD is under active development. Please don't hesitate to open feature reques
 
 Tests live in `tests/` and run in double precision:
 
+Run the full suite with uv:
+
+```sh
+JAX_ENABLE_X64=1 uv run --no-sync pytest
+```
+
+Run a specific test suite with uv:
+
 ```sh
 JAX_ENABLE_X64=1 uv run --no-sync pytest tests/<suite>_test.py
+```
+
+Without uv, install the testing dependencies and run pytest directly:
+
+```sh
+python -m pip install -e . --group testing
+JAX_ENABLE_X64=1 python -m pytest
+JAX_ENABLE_X64=1 python -m pytest tests/<suite>_test.py
 ```
 
 Run the suites affected by your change. See [CONTRIBUTING.md](CONTRIBUTING.md)
