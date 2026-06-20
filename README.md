@@ -59,6 +59,17 @@ pip install -e jax-md
 
 JAX MD is under active development. Please don't hesitate to open feature requests to help us guide development. We more than welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up.
 
+## Tests
+
+Tests live in `tests/` and run in double precision:
+
+```sh
+JAX_ENABLE_X64=1 uv run --no-sync pytest tests/<suite>_test.py
+```
+
+Run the suites affected by your change. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the full development setup.
+
 ### Technical gotchas
 
 #### GPU
