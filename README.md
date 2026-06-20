@@ -4,7 +4,7 @@
 ### Accelerated, Differentiable, Molecular Dynamics
 </div>
 
-[**Quickstart**](#getting-started) | [**Reference docs**](https://jax-md.readthedocs.io/en/main/) | [**Paper**](https://arxiv.org/pdf/1912.04232.pdf) | [**NeurIPS 2020**](https://neurips.cc/virtual/2020/public/poster_83d3d4b6c9579515e1679aca8cbc8033.html)
+[**Quickstart**](#getting-started) | [**Installation**](#installation) | [**Reference docs**](https://jax-md.readthedocs.io/en/main/) | [**Paper**](https://arxiv.org/pdf/1912.04232.pdf) | [**NeurIPS 2020**](https://neurips.cc/virtual/2020/public/poster_83d3d4b6c9579515e1679aca8cbc8033.html)
 
 [![Build](https://github.com/jax-md/jax-md/actions/workflows/build.yml/badge.svg)](https://github.com/jax-md/jax-md/actions/workflows/build.yml) ![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14220247.svg) [![PyPI](https://img.shields.io/pypi/v/jax-md)](https://pypi.org/project/jax-md/) [![PyPI - License](https://img.shields.io/pypi/l/jax_md)](https://github.com/google/jax-md/blob/main/LICENSE)
 
@@ -42,17 +42,35 @@ JAX MD also comes with self contained python scripts which you run locally if yo
 
 See [FEATURES.md](FEATURES.md) for a tour of the main library components.
 
-You can install JAX MD locally with pip,
+## Installation
+
+Install the latest published release with pip:
 
 ```
 pip install jax-md --upgrade
 ```
 
-If you want to build the latest version then you can grab the most recent version from head,
+Install the latest source checkout with pip:
 
 ```
 git clone https://github.com/jax-md/jax-md
-pip install -e jax-md
+cd jax-md
+python -m pip install -e .
+```
+
+For development with testing and documentation dependencies, install the
+dependency groups with pip:
+
+```sh
+python -m pip install -e . --group testing --group docs
+```
+
+Or use uv:
+
+```sh
+git clone https://github.com/jax-md/jax-md
+cd jax-md
+uv sync --no-default-groups --group testing --group docs
 ```
 
 ## Development
