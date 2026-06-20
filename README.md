@@ -44,33 +44,36 @@ See [FEATURES.md](FEATURES.md) for a tour of the main library components.
 
 ## Installation
 
-Install the latest published release with pip:
+We recommend using [uv](https://docs.astral.sh/uv/) for local development:
 
-```
-pip install jax-md --upgrade
-```
-
-Install the latest source checkout with pip:
-
-```
+```sh
 git clone https://github.com/jax-md/jax-md
 cd jax-md
+uv sync --no-default-groups
+```
+
+To include testing and documentation dependencies:
+
+```sh
+uv sync --no-default-groups --group testing --group docs
+```
+
+If you want to use pip instead, install the latest published release with:
+
+```sh
+python -m pip install jax-md --upgrade
+```
+
+Or install a local source checkout:
+
+```sh
 python -m pip install -e .
 ```
 
-For development with testing and documentation dependencies, install the
-dependency groups with pip:
+To include testing and documentation dependencies with pip:
 
 ```sh
 python -m pip install -e . --group testing --group docs
-```
-
-Or use uv:
-
-```sh
-git clone https://github.com/jax-md/jax-md
-cd jax-md
-uv sync --no-default-groups --group testing --group docs
 ```
 
 ## Development
