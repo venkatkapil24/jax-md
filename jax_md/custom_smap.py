@@ -9,14 +9,13 @@ lattice shifts stored in the neighbor list rather than relying on the minimum
 image convention.
 """
 
-from typing import Callable, Tuple, Optional
-import functools
+from typing import Callable, Tuple
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 from jax import ops
-from jax_md import partition, space, util
+from jax_md import partition, smap, space, util
 from jax_md.custom_partition import (
   NeighborListMultiImage,
   NeighborListFormat,
@@ -34,7 +33,7 @@ def pair_neighbor_list_multi_image(
   displacement_fn=None,  # Ignored; always uses space.free() internally
   species: Array | None = None,  # [N] or None
   reduce_axis: Tuple[int, ...] | None = None,
-  ignore_unused_parameters: bool = False,  # For API compatibility
+  ignore_unused_parameters: bool = False,
   fractional_coordinates: bool = True,
   **static_kwargs,
 ) -> Callable[..., Array]:
@@ -93,12 +92,15 @@ def pair_neighbor_list_multi_image(
       ``sigma`` and ``epsilon`` should have shape ``[max_species, max_species]``
       and will be indexed per-pair.
     fractional_coordinates: If True, positions are in fractional coordinates.
-    reduce_axis: Axis over which to reduce the energy. If ``None`` (default),
-      sums all pair energies to a scalar. If specified, returns per-atom
-      energies of shape ``[N]``. **Note:** Per-atom energies are not supported
-      with ``OrderedSparse`` format (raises ``ValueError``).
+    reduce_axis: Axes over which to reduce the energy, using the same convention
+      as ``smap.pair_neighbor_list``. If ``None`` (default), sums all pair
+      energies to a scalar. An empty tuple returns edge-wise values. Reductions
+      that retain the particle axis return per-particle values; those are not
+      supported with ``OrderedSparse`` format.
     **static_kwargs: Static parameters passed to the pair function (e.g.,
-      ``sigma``, ``epsilon``). Can be overridden at call time.
+      ``sigma``, ``epsilon``). Can be overridden at call time. Per-particle
+      parameters can use the same ``(combinator, value)`` convention as
+      ``smap.pair_neighbor_list``.
 
   Returns:
     An energy function with signature:
@@ -106,7 +108,8 @@ def pair_neighbor_list_multi_image(
 
     - Input ``R``: Positions. Shape ``[N, dim]``.
     - Input ``neighbor``: A ``NeighborListMultiImage``.
-    - Output: Total energy (scalar) or per-atom energies (shape ``[N]``).
+    - Output: Total, edge-wise, or per-particle energies as selected by
+      ``reduce_axis``.
 
   Example:
 
@@ -132,6 +135,13 @@ def pair_neighbor_list_multi_image(
        force_fn = jax.grad(lambda R, nbrs: -lj_energy(R, nbrs))
        F = force_fn(positions, nbrs)  # Shape: [N, dim]
   """
+  static_kwargs, param_combinators = smap._split_params_and_combinators(
+    static_kwargs
+  )
+  merge_dicts = partial(
+    util.merge_dicts, ignore_unused_parameters=ignore_unused_parameters
+  )
+
   # Use space.free() displacement which handles perturbation via kwargs
   # Delete the passed displacement_fn since it is ignored.
   del displacement_fn
@@ -143,8 +153,7 @@ def pair_neighbor_list_multi_image(
     **kwargs,
   ) -> Array:  # scalar or [N]
     """Compute total pair energy."""
-    merged_kwargs = {**static_kwargs, **kwargs}
-    _species = merged_kwargs.pop('species', species)
+    _species = kwargs.get('species', species)
 
     box = neighbor.box  # [dim, dim]
     N = R.shape[0]
@@ -171,49 +180,59 @@ def pair_neighbor_list_multi_image(
       # Use displacement function which handles perturbation naturally
       Ra = R_real[i_safe]  # [capacity, dim]
       Rb_shifted = R_real[j_safe] + shifts_real  # [capacity, dim]
-      d = jax.vmap(partial(displacement_fn, **merged_kwargs))
+      d = jax.vmap(partial(displacement_fn, **kwargs))
       dR = d(Ra, Rb_shifted)  # [capacity, dim]
 
       # Compute scalar distances
       dr = space.distance(dR)  # [capacity]
 
-      # Handle species-dependent parameters
-      if _species is not None:
-        species_i = _species[i_safe]  # [capacity]
-        species_j = _species[j_safe]  # [capacity]
-        processed_kwargs = {}
-        for key, val in merged_kwargs.items():
-          if jnp.ndim(val) == 2:
-            processed_kwargs[key] = val[species_i, species_j]  # [capacity]
-          else:
-            processed_kwargs[key] = val
-        merged_kwargs = processed_kwargs
+      merged_kwargs = merge_dicts(static_kwargs, kwargs)
+      merged_kwargs = smap._neighborhood_kwargs_to_params(
+        neighbor.format,
+        neighbor.idx,
+        _species,
+        merged_kwargs,
+        param_combinators,
+      )
 
       # Compute pair energies
       pair_energies = pair_fn(dr, **merged_kwargs)  # [capacity]
       zero = jnp.zeros((), dtype=pair_energies.dtype)
-      pair_energies = jnp.where(mask, pair_energies, zero)  # [capacity]
 
       # Normalization: OrderedSparse stores one direction, Sparse stores both
       normalization = (
         1.0 if neighbor.format is NeighborListFormat.OrderedSparse else 2.0
       )
 
+      if pair_energies.ndim > mask.ndim:
+        mask = jnp.reshape(
+          mask, mask.shape + (1,) * (pair_energies.ndim - mask.ndim)
+        )
+      pair_energies = jnp.where(mask, pair_energies, zero)
+
+      if reduce_axis is not None and len(reduce_axis) == 0:
+        return pair_energies / normalization
+
       if reduce_axis is None:
         return util.high_precision_sum(pair_energies) / normalization
-      else:
-        # Per-particle energy via segment_sum
-        if neighbor.format is NeighborListFormat.OrderedSparse:
-          raise ValueError(
-            'Cannot compute per-particle energies with OrderedSparse format. '
-            'OrderedSparse stores only one direction per pair, so segment_sum '
-            'would assign the full pair energy to the receiver atom only. '
-            'Use Sparse or Dense format for per-particle energies.'
-          )
-        particle_energies = ops.segment_sum(
-          pair_energies * mask, neighbor.receivers, N
-        )  # [N]
-        return particle_energies / normalization
+
+      if 0 in reduce_axis and 1 not in reduce_axis:
+        raise ValueError()
+
+      edge_reduce_axis = tuple(axis - 1 for axis in reduce_axis if axis > 1)
+      if 0 in reduce_axis:
+        return util.high_precision_sum(pair_energies, (0,) + edge_reduce_axis)
+
+      if neighbor.format is NeighborListFormat.OrderedSparse:
+        raise ValueError(
+          'Cannot report per-particle values with an OrderedSparse '
+          'neighbor list.'
+        )
+
+      pair_energies = util.high_precision_sum(pair_energies, edge_reduce_axis)
+      return (
+        ops.segment_sum(pair_energies, neighbor.receivers, N) / normalization
+      )
 
     else:
       # Dense format: per-atom neighbor arrays
@@ -251,7 +270,7 @@ def pair_neighbor_list_multi_image(
       Rb_flat = Rb_shifted.reshape(
         -1, Rb_shifted.shape[-1]
       )  # [N*max_neighbors, dim]
-      d = jax.vmap(partial(displacement_fn, **merged_kwargs))
+      d = jax.vmap(partial(displacement_fn, **kwargs))
       dR_flat = d(Ra_flat, Rb_flat)  # [N*max_neighbors, dim]
       dR = dR_flat.reshape(
         idx.shape[0], idx.shape[1], -1
@@ -260,37 +279,37 @@ def pair_neighbor_list_multi_image(
       # Compute scalar distances
       dr = space.distance(dR)  # [N, max_neighbors]
 
-      # Handle species-dependent parameters
-      if _species is not None:
-        species_i = jnp.broadcast_to(
-          _species[:, None], idx.shape
-        )  # [N, max_neighbors]
-        species_j = _species[j_safe]  # [N, max_neighbors]
-        processed_kwargs = {}
-        for key, val in merged_kwargs.items():
-          if jnp.ndim(val) == 2:
-            processed_kwargs[key] = val[
-              species_i, species_j
-            ]  # [N, max_neighbors]
-          else:
-            processed_kwargs[key] = val
-        merged_kwargs = processed_kwargs
+      merged_kwargs = merge_dicts(static_kwargs, kwargs)
+      merged_kwargs = smap._neighborhood_kwargs_to_params(
+        neighbor.format,
+        neighbor.idx,
+        _species,
+        merged_kwargs,
+        param_combinators,
+      )
 
       # Compute pair energies
       pair_energies = pair_fn(dr, **merged_kwargs)  # [N, max_neighbors]
       zero = jnp.zeros((), dtype=pair_energies.dtype)
-      pair_energies = jnp.where(mask, pair_energies, zero)  # [N, max_neighbors]
 
       # Dense stores both directions, so divide by 2
       normalization = 2.0
 
+      if pair_energies.ndim > mask.ndim:
+        mask = jnp.reshape(
+          mask, mask.shape + (1,) * (pair_energies.ndim - mask.ndim)
+        )
+      pair_energies = jnp.where(mask, pair_energies, zero)
+
+      if reduce_axis is not None and len(reduce_axis) == 0:
+        return pair_energies / normalization
+
       if reduce_axis is None:
         return util.high_precision_sum(pair_energies) / normalization
-      else:
-        # Per-particle energy: sum over neighbors (axis 1)
-        particle_energies = util.high_precision_sum(
-          pair_energies, axis=1
-        )  # [N]
-        return particle_energies / normalization
+
+      if 0 in reduce_axis and 1 not in reduce_axis:
+        raise ValueError()
+
+      return util.high_precision_sum(pair_energies, reduce_axis) / normalization
 
   return energy_fn

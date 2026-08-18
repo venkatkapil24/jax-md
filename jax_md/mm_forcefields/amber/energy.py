@@ -23,7 +23,15 @@ import numpy as onp
 import scipy
 from jax.scipy.special import erfc
 
-from jax_md import dataclasses, partition, smap, space, util
+from jax_md import (
+  custom_partition,
+  custom_smap,
+  dataclasses,
+  partition,
+  smap,
+  space,
+  util,
+)
 from jax_md.mm_forcefields import neighbor
 from jax_md.mm_forcefields.base import (
   NonbondedOptions,
@@ -203,6 +211,7 @@ def energy(
   fe_options: FEOptions = FEOptions(),
   precision: str | None = None,
   dense_mask_format: bool = True,
+  multi_image: bool = False,
 ) -> tuple[
   Callable[..., dict[str, Array]],
   partition.NeighborListFns,
@@ -224,6 +233,9 @@ def energy(
       and PBC handling
     fe_options: Free-energy/alchemical option
     precision: "single" or "double" or "mixed" # TODO currently not implemented
+    multi_image: Use explicit periodic images for nonbonded interactions. This
+      is required when the nonbonded cutoff exceeds half a periodic box height.
+      The default False preserves the minimum-image neighbor-list path.
 
   Returns:
     A tuple (energy_fn, neighbor_fn, displacement_fn, shift_fn) where:
@@ -397,6 +409,17 @@ def energy(
 
   disp_fn, shift_fn = space_selector(nb_options, box_vectors)
 
+  pair_neighbor_list_fn = (
+    custom_smap.pair_neighbor_list_multi_image
+    if multi_image
+    else smap.pair_neighbor_list
+  )
+  pair_neighbor_list_kwargs = (
+    {'fractional_coordinates': nb_options.fractional_coordinates}
+    if multi_image
+    else {}
+  )
+
   if isinstance(coulomb_options, PMECoulomb):
     coulomb_method = 'PME'
   elif isinstance(coulomb_options, EwaldCoulomb):
@@ -531,7 +554,7 @@ def energy(
 
   # NOTE the alpha value is closed over during generation which
   # may be an issue if the grid layout changes during dynamics
-  pair_lj_edge_fn = smap.pair_neighbor_list(
+  pair_lj_edge_fn = pair_neighbor_list_fn(
     fused_nb_fn,
     space.canonicalize_displacement_or_metric(disp_fn),
     reduce_axis=(),  # return edge-wise terms to support SC/CC masking
@@ -541,6 +564,7 @@ def energy(
     lj2=lj2_rule,
     charge_sq=(combine_product, None),
     alpha=coulomb.alpha if use_erfc else 0.0,
+    **pair_neighbor_list_kwargs,
   )
 
   pair_coul_1r_edge_fn = None
@@ -551,12 +575,13 @@ def energy(
         * (charge_sq / jnp.where(jnp.isclose(dr, 0.0), 1.0, dr))
       )
     )
-    pair_coul_1r_edge_fn = smap.pair_neighbor_list(
+    pair_coul_1r_edge_fn = pair_neighbor_list_fn(
       coul_1r_wrapped,
       space.canonicalize_displacement_or_metric(disp_fn),
       reduce_axis=(),
       ignore_unused_parameters=True,
       charge_sq=(combine_product, None),
+      **pair_neighbor_list_kwargs,
     )
 
   softcore_lj_edge_fn = None
@@ -564,7 +589,7 @@ def energy(
     softcore_wrapped = vdw_cutoff_fn(
       jax.tree_util.Partial(lennard_jones_softcore)
     )
-    softcore_lj_edge_fn = smap.pair_neighbor_list(
+    softcore_lj_edge_fn = pair_neighbor_list_fn(
       softcore_wrapped,
       space.canonicalize_displacement_or_metric(disp_fn),
       reduce_axis=(),
@@ -573,6 +598,7 @@ def energy(
       sigma=(combine_lorentz, None),
       epsilon=(combine_berthelot, None),
       cl_lambda=None,
+      **pair_neighbor_list_kwargs,
     )
 
   bond_lj_fn = smap.bond(
@@ -596,14 +622,16 @@ def energy(
   # NOTE it might help to organize masking and conversion primitives
   # to handle any case of dense, sparse, (N,N), orderedsparse, etc
   # TODO consider if forcing 32 bit here will improve performance
-  if dense_mask_format:
-    mask_fn = _create_dense_mask(
-      topology.n_atoms, jnp.asarray(topology.exc_pairs)
-    )
-  else:
-    mask_fn = _create_sparse_mask(
-      topology.n_atoms, jnp.asarray(topology.exc_pairs)
-    )
+  mask_fn = None
+  if not multi_image:
+    if dense_mask_format:
+      mask_fn = _create_dense_mask(
+        topology.n_atoms, jnp.asarray(topology.exc_pairs)
+      )
+    else:
+      mask_fn = _create_sparse_mask(
+        topology.n_atoms, jnp.asarray(topology.exc_pairs)
+      )
 
   # NOTE It's desireable to still use the neighbor list machinery to handle
   # non periodic systems for uniform exclusion masking and smap use.
@@ -615,17 +643,114 @@ def energy(
   neighbor_box = box_vectors if nb_options.use_pbc else 1.0
   neighbor_r_cut = nb_options.r_cut if nb_options.r_cut is not None else jnp.inf
 
-  neighbor_fn = neighbor.create_neighbor_list(
-    disp_fn,
-    neighbor_box,
-    neighbor_r_cut,
-    nb_options.dr_threshold,
-    custom_mask_function=mask_fn,
-    fractional_coordinates=nb_options.fractional_coordinates,
-    format=nb_options.nb_format,
-    disable_cell_list=not nb_options.use_pbc,
-    dense_candidate_format=dense_mask_format,
-  )
+  if multi_image:
+    if not nb_options.use_pbc:
+      raise ValueError(
+        'Multi-image neighbor lists require periodic boundaries.'
+      )
+    if box_vectors is None:
+      raise ValueError('Multi-image neighbor lists require box vectors.')
+    if nb_options.r_cut is None:
+      raise ValueError('Multi-image neighbor lists require a finite cutoff.')
+
+    multi_image_box = jnp.asarray(box_vectors)
+    if multi_image_box.ndim == 0:
+      multi_image_box = (
+        jnp.eye(3, dtype=multi_image_box.dtype) * multi_image_box
+      )
+    elif multi_image_box.ndim == 1:
+      multi_image_box = jnp.diag(multi_image_box)
+    elif multi_image_box.ndim != 2:
+      raise ValueError(
+        'Multi-image box must be a scalar, vector, or rank-2 matrix.'
+      )
+
+    neighbor_fn = custom_partition.neighbor_list_multi_image(
+      None,
+      multi_image_box,
+      neighbor_r_cut,
+      nb_options.dr_threshold,
+      fractional_coordinates=nb_options.fractional_coordinates,
+      format=nb_options.nb_format,
+    )
+  else:
+    assert mask_fn is not None
+    neighbor_fn = neighbor.create_neighbor_list(
+      disp_fn,
+      neighbor_box,
+      neighbor_r_cut,
+      nb_options.dr_threshold,
+      custom_mask_function=mask_fn,
+      fractional_coordinates=nb_options.fractional_coordinates,
+      format=nb_options.nb_format,
+      disable_cell_list=not nb_options.use_pbc,
+      dense_candidate_format=dense_mask_format,
+    )
+
+  exception_neighbors = None
+  if multi_image:
+    if topology.exc_pairs is None:
+      exception_pairs = onp.zeros((0, 2), dtype=onp.int32)
+    else:
+      exception_pairs = onp.asarray(topology.exc_pairs, dtype=onp.int32)
+    exception_count = onp.zeros((topology.n_atoms,), dtype=onp.int32)
+    for atom_i, atom_j in exception_pairs:
+      exception_count[atom_i] += 1
+      exception_count[atom_j] += 1
+    max_exceptions = max(1, int(onp.max(exception_count, initial=0)))
+    exception_table = onp.full(
+      (topology.n_atoms, max_exceptions),
+      topology.n_atoms,
+      dtype=onp.int32,
+    )
+    exception_count.fill(0)
+    for atom_i, atom_j in exception_pairs:
+      exception_table[atom_i, exception_count[atom_i]] = atom_j
+      exception_table[atom_j, exception_count[atom_j]] = atom_i
+      exception_count[atom_i] += 1
+      exception_count[atom_j] += 1
+    exception_neighbors = jnp.asarray(exception_table)
+
+  def _central_exception_edges(nbr_list: NeighborList) -> Array:
+    """Mask force-field exceptions only in the unshifted unit cell."""
+    if not multi_image:
+      raise ValueError(
+        'Central-image masks are only defined in multi-image mode.'
+      )
+    assert exception_neighbors is not None
+
+    if partition.is_sparse(nbr_list.format):
+      receiver = nbr_list.idx[0]
+      sender = nbr_list.idx[1]
+    else:
+      receiver = jnp.broadcast_to(
+        jnp.arange(topology.n_atoms, dtype=jnp.int32)[:, None],
+        nbr_list.idx.shape,
+      )
+      sender = nbr_list.idx
+
+    valid = (receiver < topology.n_atoms) & (sender < topology.n_atoms)
+    receiver_safe = jnp.where(valid, receiver, 0)
+    sender_safe = jnp.where(valid, sender, 0)
+    central_image = jnp.all(nbr_list.shifts == 0, axis=-1)
+    is_exception = jnp.any(
+      exception_neighbors[receiver_safe] == sender_safe[..., None], axis=-1
+    )
+    return valid & central_image & is_exception
+
+  def _remove_central_exception_edges(
+    edge_values: Array, nbr_list: NeighborList
+  ) -> Array:
+    if not multi_image:
+      return edge_values
+    exception_edges = _central_exception_edges(nbr_list)
+    if edge_values.ndim > exception_edges.ndim:
+      exception_edges = jnp.reshape(
+        exception_edges,
+        exception_edges.shape
+        + (1,) * (edge_values.ndim - exception_edges.ndim),
+      )
+    return jnp.where(exception_edges, 0.0, edge_values)
 
   def _sc_edge_masks(nbr_list: NeighborList) -> tuple[Array, Array, Array]:
     if nb_options.nb_format in (
@@ -885,6 +1010,7 @@ def energy(
       charge_sq=nonbonded.charges,
       **space_kwarg,
     )
+    edge_terms = _remove_central_exception_edges(edge_terms, nbr_list)
     lj_edge = edge_terms[..., 0]
     coul_dir_edge = edge_terms[..., 1]
 
@@ -903,6 +1029,9 @@ def energy(
         charge_sq=params.nonbonded.charges,
         **space_kwarg,
       )
+      sc_sc_coul_1r_edge = _remove_central_exception_edges(
+        sc_sc_coul_1r_edge, nbr_list
+      )
       sc_sc_coul_full = jnp.sum(jnp.where(sc_sc_mask, sc_sc_coul_1r_edge, 0.0))
       sc_sc_coul_addback = (1.0 - lambda_q * lambda_q) * sc_sc_coul_full
       coul_dir_pot = coul_dir_pot + sc_sc_coul_addback
@@ -919,6 +1048,7 @@ def energy(
         cl_lambda=cl_lambda,
         **space_kwarg,
       )
+      soft_lj_edge = _remove_central_exception_edges(soft_lj_edge, nbr_list)
       sc_sc_mask, sc_cc_mask, cc_cc_mask = _sc_edge_masks(nbr_list)
 
       lj_sc_sc = jnp.sum(jnp.where(sc_sc_mask, lj_edge, 0.0))

@@ -242,6 +242,81 @@ class CustomSmapTest(test_util.JAXMDTestCase):
 
     self.assertTrue(np.isfinite(E))
 
+  def test_pair_multi_image_combinator_and_edge_output(self):
+    """Per-particle combinators and reduce_axis=() match standard smap."""
+
+    def pair_terms(dr, sigma, epsilon):
+      return np.stack((sigma * dr, epsilon / (1.0 + dr)), axis=-1)
+
+    def arithmetic(x, y):
+      return 0.5 * (x + y)
+
+    def geometric(x, y):
+      return np.sqrt(x * y)
+
+    positions = np.array(
+      [[1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0]],
+      dtype=f32,
+    )
+    sigma = np.array([1.0, 1.2, 1.4], dtype=f32)
+    epsilon = np.array([0.2, 0.4, 0.8], dtype=f32)
+    box_size = 8.0
+    cutoff = 2.5
+
+    displacement, _ = space.periodic(box_size)
+    standard_neighbor_fn = partition.neighbor_list(
+      displacement,
+      box_size,
+      cutoff,
+      format=NeighborListFormat.OrderedSparse,
+    )
+    standard_neighbors = standard_neighbor_fn.allocate(positions)
+    standard_fn = smap.pair_neighbor_list(
+      pair_terms,
+      space.metric(displacement),
+      reduce_axis=(),
+      sigma=(arithmetic, None),
+      epsilon=(geometric, None),
+    )
+    standard_edges = standard_fn(
+      positions,
+      standard_neighbors,
+      sigma=sigma,
+      epsilon=epsilon,
+    )
+
+    box = np.eye(3, dtype=f32) * box_size
+    multi_neighbor_fn = neighbor_list_multi_image(
+      None,
+      box,
+      cutoff,
+      fractional_coordinates=False,
+      format=NeighborListFormat.OrderedSparse,
+    )
+    multi_neighbors = multi_neighbor_fn.allocate(positions)
+    multi_fn = pair_neighbor_list_multi_image(
+      pair_terms,
+      reduce_axis=(),
+      fractional_coordinates=False,
+      sigma=(arithmetic, None),
+      epsilon=(geometric, None),
+    )
+    multi_edges = multi_fn(
+      positions,
+      multi_neighbors,
+      sigma=sigma,
+      epsilon=epsilon,
+    )
+
+    self.assertEqual(multi_edges.ndim, 2)
+    self.assertEqual(multi_edges.shape[-1], 2)
+    self.assertAllClose(
+      np.sum(multi_edges, axis=0),
+      np.sum(standard_edges, axis=0),
+      rtol=1e-6,
+      atol=1e-6,
+    )
+
   @parameterized.named_parameters(
     test_util.cases_from_list(
       {
