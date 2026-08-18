@@ -263,7 +263,7 @@ def _compute_pairwise_mask(
 
     \|\mathbf{r}_j + \mathbf{s} \cdot \mathbf{T} - \mathbf{r}_i\| < r_\text{cut}
 
-  Self-interactions (:math:`i = j` with zero shift) are excluded.
+  Self-interactions (:math:`i = j`) are excluded for every explicit image.
 
   Uses ``vmap`` over shifts for better memory locality and fused computation.
 
@@ -300,10 +300,14 @@ def _compute_pairwise_mask(
 
   within_cutoff = jax.vmap(mask_for_shift)(shifts_real)  # [num_shifts, N, N]
 
-  # Exclude self-interactions (i == j with zero shift)
+  # Exclude self-interactions for every lattice image.  The explicit-image
+  # list is used for conventional periodic pair potentials, where a particle
+  # must not interact with a copy of itself in another cell.  (The zero-shift
+  # case is the usual neighbor-list self-interaction exclusion.)
   self_mask = jnp.eye(N, dtype=bool)  # [N, N]
-  zero_shift_mask = jnp.arange(num_shifts) == zero_shift_idx  # [num_shifts]
-  self_interaction = zero_shift_mask[:, None, None] & self_mask[None, :, :]
+  self_interaction = jnp.broadcast_to(
+    self_mask[None, :, :], (num_shifts, N, N)
+  )
   within_cutoff = within_cutoff & ~self_interaction  # [num_shifts, N, N]
 
   return within_cutoff
@@ -568,11 +572,12 @@ def _build_neighbor_list_dense(
     position, box, shifts_real, fractional_coordinates
   )  # [num_shifts, N, N]
 
-  # Valid neighbors: within cutoff, excluding self (i==j with zero shift)
+  # Valid neighbors: within cutoff, excluding self interactions in every image.
   within_cutoff = dist_sq < r_cutoff**2  # [num_shifts, N, N]
   self_mask = jnp.eye(N, dtype=bool)  # [N, N]
-  zero_shift_mask = jnp.arange(num_shifts) == zero_shift_idx  # [num_shifts]
-  self_interaction = zero_shift_mask[:, None, None] & self_mask[None, :, :]
+  self_interaction = jnp.broadcast_to(
+    self_mask[None, :, :], (num_shifts, N, N)
+  )
   valid = within_cutoff & ~self_interaction  # [num_shifts, N, N]
 
   # Reshape to per-atom view: [N, num_shifts * N]

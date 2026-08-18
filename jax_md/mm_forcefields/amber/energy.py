@@ -711,11 +711,16 @@ def energy(
       exception_count[atom_j] += 1
     exception_neighbors = jnp.asarray(exception_table)
 
-  def _central_exception_edges(nbr_list: NeighborList) -> Array:
-    """Mask force-field exceptions only in the unshifted unit cell."""
+  def _exception_edges(nbr_list: NeighborList) -> Array:
+    """Mask force-field exceptions in every explicitly enumerated image.
+
+    Molecular coordinates may be wrapped at a cell boundary, so a bonded
+    exception can appear at a nonzero lattice shift even though it is a
+    zero-shift exception in the molecule's unwrapped representation.
+    """
     if not multi_image:
       raise ValueError(
-        'Central-image masks are only defined in multi-image mode.'
+        'Multi-image exception masks are only defined in multi-image mode.'
       )
     assert exception_neighbors is not None
 
@@ -732,18 +737,17 @@ def energy(
     valid = (receiver < topology.n_atoms) & (sender < topology.n_atoms)
     receiver_safe = jnp.where(valid, receiver, 0)
     sender_safe = jnp.where(valid, sender, 0)
-    central_image = jnp.all(nbr_list.shifts == 0, axis=-1)
     is_exception = jnp.any(
       exception_neighbors[receiver_safe] == sender_safe[..., None], axis=-1
     )
-    return valid & central_image & is_exception
+    return valid & is_exception
 
-  def _remove_central_exception_edges(
+  def _remove_exception_edges(
     edge_values: Array, nbr_list: NeighborList
   ) -> Array:
     if not multi_image:
       return edge_values
-    exception_edges = _central_exception_edges(nbr_list)
+    exception_edges = _exception_edges(nbr_list)
     if edge_values.ndim > exception_edges.ndim:
       exception_edges = jnp.reshape(
         exception_edges,
@@ -1010,7 +1014,7 @@ def energy(
       charge_sq=nonbonded.charges,
       **space_kwarg,
     )
-    edge_terms = _remove_central_exception_edges(edge_terms, nbr_list)
+    edge_terms = _remove_exception_edges(edge_terms, nbr_list)
     lj_edge = edge_terms[..., 0]
     coul_dir_edge = edge_terms[..., 1]
 
@@ -1029,7 +1033,7 @@ def energy(
         charge_sq=params.nonbonded.charges,
         **space_kwarg,
       )
-      sc_sc_coul_1r_edge = _remove_central_exception_edges(
+      sc_sc_coul_1r_edge = _remove_exception_edges(
         sc_sc_coul_1r_edge, nbr_list
       )
       sc_sc_coul_full = jnp.sum(jnp.where(sc_sc_mask, sc_sc_coul_1r_edge, 0.0))
@@ -1048,7 +1052,7 @@ def energy(
         cl_lambda=cl_lambda,
         **space_kwarg,
       )
-      soft_lj_edge = _remove_central_exception_edges(soft_lj_edge, nbr_list)
+      soft_lj_edge = _remove_exception_edges(soft_lj_edge, nbr_list)
       sc_sc_mask, sc_cc_mask, cc_cc_mask = _sc_edge_masks(nbr_list)
 
       lj_sc_sc = jnp.sum(jnp.where(sc_sc_mask, lj_edge, 0.0))

@@ -1,14 +1,10 @@
 """Focused tests for explicit-image molecular-mechanics nonbonded terms."""
 
-import itertools
-import math
-
 from absl.testing import absltest
 import jax
 
 jax.config.update('jax_enable_x64', True)
 import jax.numpy as jnp
-import numpy as np
 
 from jax_md import partition
 from jax_md import test_util
@@ -101,33 +97,11 @@ class AmberMultiImageTest(test_util.JAXMDTestCase):
     self.assertAllClose(energies[0], energies[1], rtol=1e-12, atol=1e-12)
     self.assertAllClose(forces[0], forces[1], rtol=1e-12, atol=1e-12)
 
-  def test_exception_removes_only_the_central_image(self):
+  def test_exception_removes_all_explicit_images(self):
     params, topology = _two_atom_system(with_exception=True)
     positions = jnp.array([[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]], dtype=jnp.float64)
-    box_length = 2.0
     cutoff = 2.5
-    box = jnp.array([box_length] * 3, dtype=jnp.float64)
-    positions_np = np.asarray(positions)
-    sigma = np.asarray(params.nonbonded.sigma)
-    epsilon = np.asarray(params.nonbonded.epsilon)
-    expected = 0.0
-    for i, j in itertools.product(range(2), repeat=2):
-      for shift in itertools.product(range(-2, 3), repeat=3):
-        if i == j and shift == (0, 0, 0):
-          continue
-        if i != j and shift == (0, 0, 0):
-          continue
-        delta = (
-          positions_np[j] + box_length * np.asarray(shift) - positions_np[i]
-        )
-        distance = float(np.linalg.norm(delta))
-        if distance >= cutoff:
-          continue
-        sigma_ij = 0.5 * (sigma[i] + sigma[j])
-        epsilon_ij = math.sqrt(epsilon[i] * epsilon[j])
-        ratio6 = (sigma_ij / distance) ** 6
-        expected += 4.0 * epsilon_ij * (ratio6 * ratio6 - ratio6)
-    expected *= 0.5
+    box = jnp.array([2.0] * 3, dtype=jnp.float64)
 
     for neighbor_format in (
       partition.NeighborListFormat.Dense,
@@ -146,8 +120,9 @@ class AmberMultiImageTest(test_util.JAXMDTestCase):
         neighbors = neighbor_fn.allocate(positions)
         actual = energy_fn(positions, neighbors)['lj_pot']
 
-        self.assertAllClose(actual, expected, rtol=1e-12, atol=1e-12)
-        self.assertNotEqual(float(actual), 0.0)
+        # A wrapped molecular exception must be removed whether the matching
+        # pair is represented in the central cell or at an explicit image.
+        self.assertAllClose(actual, 0.0, rtol=1e-12, atol=1e-12)
 
 
 if __name__ == '__main__':

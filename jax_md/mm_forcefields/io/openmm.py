@@ -860,8 +860,19 @@ def convert_openmm_system(
         cmap_atoms_arr[t] = (a1, a2, a3, a4, b1, b2, b3, b4)
     elif isinstance(force, openmm.CustomTorsionForce):
       energy_function = force.getEnergyFunction()
-      # TODO probably a better way to search for custom force definitions
-      if 'min(dtheta' not in energy_function or 'theta0' not in energy_function:
+      # CHARMM impropers have appeared in two equivalent OpenMM expression
+      # forms.  Older OpenMM/ParmEd versions use an explicit ``min(dtheta, ...)``
+      # expression, while newer versions emit the wrapped-angle form using
+      # ``floor``.  Both are consumed by ``harmonic_improper`` below.
+      is_wrapped_harmonic = (
+        'min(dtheta' in energy_function and 'theta0' in energy_function
+      )
+      is_torus_harmonic = (
+        'dtheta_torus' in energy_function
+        and 'floor(dtheta' in energy_function
+        and 'theta0' in energy_function
+      )
+      if not (is_wrapped_harmonic or is_torus_harmonic):
         raise NotImplementedError(
           f'Unsupported CustomTorsionForce energy function: {energy_function}'
         )
