@@ -1107,7 +1107,10 @@ def stochastic_step(
   c2 = jnp.sqrt(kT * (1 - c1**2))
   momentum_dist = Normal(c1 * state.momentum, c2**2 * state.mass)
   key, split = random.split(state.rng)
-  return state.set(momentum=momentum_dist.sample(split), rng=key)
+  momentum = jnp.asarray(
+    momentum_dist.sample(split), dtype=state.momentum.dtype
+  )
+  return state.set(momentum=momentum, rng=key)
 
 
 def nvt_langevin(
@@ -1168,7 +1171,11 @@ def nvt_langevin(
       state = initialize_momenta(state, split, _kT)
     else:
       state = canonicalize_momenta(state, momenta)
-    return state
+    return state.set(
+      momentum=tree_map(
+        lambda p, r: jnp.asarray(p, dtype=r.dtype), state.momentum, R
+      )
+    )
 
   @jit
   def step_fn(state, **kwargs):

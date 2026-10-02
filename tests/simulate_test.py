@@ -874,6 +874,31 @@ class SimulateTest(test_util.JAXMDTestCase):
       assert np.abs(T_emp - T) < 0.1
       assert state.position.dtype == dtype
 
+  @parameterized.product(dtype=DTYPE, parameter_dtype=DTYPE)
+  def test_langevin_preserves_precision(self, dtype, parameter_dtype):
+    """Temperature and friction precision must not change the MD precision."""
+    E = lambda R, **kwargs: np.sum(R**2)
+    _, shift = space.free()
+    init, step = simulate.nvt_langevin(
+      E,
+      shift,
+      0.001,
+      parameter_dtype(1.0),
+      gamma=parameter_dtype(0.1),
+    )
+    state = init(random.PRNGKey(0), np.ones((2, 3), dtype=dtype))
+    self.assertEqual(state.momentum.dtype, dtype)
+    advanced = jit(
+      lambda s: lax.fori_loop(
+        0, 10, lambda _, s: step(s, kT=parameter_dtype(2.0)), s
+      )
+    )(state)
+    for before, after in zip(
+      jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(advanced)
+    ):
+      self.assertEqual(after.dtype, before.dtype)
+      self.assertTrue(onp.all(onp.isfinite(after)))
+
   def test_langevin_harmonic(self):
     alpha = 1.0
     E = lambda x: jnp.sum(0.5 * alpha * x**2)
