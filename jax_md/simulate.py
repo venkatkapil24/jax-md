@@ -1656,7 +1656,9 @@ def _npt_csvr_rescale_temperature(state, kT, new_kT, *, pressure, new_pressure):
   return state.set(
     momentum=_scale_exchange_variable(state.momentum, jnp.sqrt(ratio)),
     box_momentum=_scale_exchange_variable(state.box_momentum, jnp.sqrt(ratio)),
-    conserved_quantity=state.conserved_quantity + jump,
+    conserved_quantity=jnp.asarray(
+      state.conserved_quantity + jump, dtype=state.conserved_quantity.dtype
+    ),
   )
 
 

@@ -1212,6 +1212,63 @@ class ReplicaExchangeTest(test_util.JAXMDTestCase):
     advanced = jit(lambda s: step(s, kT=dtype(4.0), **parameters))(changed)
     self.assertTrue(onp.all(onp.isfinite(advanced.momentum)))
 
+  @parameterized.product(
+    integrator=['langevin', 'csvr', 'npt_csvr'],
+    dtype=DTYPE,
+    parameter_dtype=DTYPE,
+  )
+  def test_exchange_preserves_precision(
+    self, integrator, dtype, parameter_dtype
+  ):
+    """A mixed-precision ladder must work before, during, and after a swap."""
+    E = lambda R, **kwargs: np.sum(R**2)
+    R = np.array([[0.2, 0.3, 0.4], [0.6, 0.7, 0.8]], dtype=dtype)
+    if integrator == 'npt_csvr':
+      _, shift = space.periodic_general(dtype(3.0))
+      init_md, step_md = simulate.npt_csvr(E, shift, 0.001, 0.2, 1.0, 1.0, 0.1)
+      replicas = vmap(lambda key: init_md(key, R, dtype(3.0)))(
+        random.split(random.PRNGKey(0), 2)
+      )
+      pressures = np.array([0.2, 0.4], dtype=parameter_dtype)
+      changed = jit(
+        lambda s: simulate.rescale_temperature(
+          s,
+          parameter_dtype(1.0),
+          parameter_dtype(2.0),
+          pressure=parameter_dtype(0.2),
+          new_pressure=parameter_dtype(0.4),
+        )
+      )(jax.tree_util.tree_map(lambda x: x[0], replicas))
+      self.assertEqual(changed.conserved_quantity.dtype, dtype)
+    else:
+      _, shift = space.free()
+      init_md, step_md = (
+        simulate.nvt_langevin(E, shift, 0.001, 1.0)
+        if integrator == 'langevin'
+        else simulate.temp_csvr(E, shift, 0.001, 1.0, 0.1)
+      )
+      replicas = vmap(lambda key: init_md(key, R))(
+        random.split(random.PRNGKey(0), 2)
+      )
+      pressures = None
+    init, step = replica_exchange.replica_exchange(
+      E,
+      step_md,
+      np.array([1.0, 2.0], dtype=parameter_dtype),
+      pressures,
+      stride=2,
+    )
+    initial = init(random.PRNGKey(1), replicas)
+    advanced = jit(lambda s: lax.fori_loop(0, 3, lambda _, s: step(s), s))(
+      initial
+    )
+    self.assertEqual(int(advanced.step), 3)
+    for before, after in zip(
+      jax.tree_util.tree_leaves(initial), jax.tree_util.tree_leaves(advanced)
+    ):
+      self.assertEqual(after.dtype, before.dtype)
+      self.assertTrue(onp.all(onp.isfinite(after)))
+
   def test_csvr_dynamic_temperature(self):
     """The CSVR step must use the supplied replica temperature."""
     E = lambda R, **kwargs: np.sum(R**2)

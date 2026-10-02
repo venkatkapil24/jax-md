@@ -214,8 +214,9 @@ def replica_exchange(
       raise ValueError(
         'Replica temperatures and pressures are fixed by the ladder.'
       )
+    dtype = jax.tree_util.tree_leaves(state.replicas.position)[0].dtype
     targets = jax.tree_util.tree_map(
-      lambda x: x[state.ensemble_indices], parameters
+      lambda x: jnp.asarray(x[state.ensemble_indices], dtype=dtype), parameters
     )
     replicas = vmap(lambda md, target: apply_md_fn(md, **target, **kwargs))(
       state.replicas, targets
