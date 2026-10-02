@@ -1571,6 +1571,88 @@ def npt_csvr(
   return init_fn, apply_fn
 
 
+@functools.singledispatch
+def log_probability(state, energy_fn, kT, **kwargs):
+  """Return the configurational log Boltzmann weight for replica exchange.
+
+  The common call is ``log_probability(state, energy_fn, kT, **kwargs)``.
+  NVT returns ``-U / kT``; NPT requires ``pressure`` and returns
+  ``-(U + pressure * volume) / kT``. Normalization and coordinate-measure
+  factors common to the exchanged ensembles are omitted. All replicas must
+  share the Hamiltonian, particle masses, constraints, and coordinate measure.
+
+  Kinetic variables are integrated out. An accepted temperature exchange must
+  also apply :func:`rescale_temperature` to preserve their distributions.
+  This weight is independent of the integrator's conserved quantity.
+
+  ``energy_fn`` must return a scalar potential energy. Remaining keyword
+  arguments are forwarded to it, including the current ``box`` for NPT.
+  Dispatch is on the MD state type and occurs during JAX tracing. Custom
+  canonical integrators can register implementations using ``.register``.
+  Built-in support covers NVT Langevin/CSVR and NPT CSVR.
+  """
+  raise TypeError(f'Unsupported thermal state: {type(state).__name__}')
+
+
+@log_probability.register(NVTLangevinState)
+def _nvt_log_probability(state, energy_fn, kT, **kwargs):
+  return -energy_fn(state.position, **kwargs) / kT
+
+
+@log_probability.register(NPTCSVRState)
+def _npt_log_probability(state, energy_fn, kT, *, pressure, **kwargs):
+  box = state.box
+  volume = quantity.volume(state.position.shape[-1], box)
+  return (
+    -(energy_fn(state.position, box=box, **kwargs) + pressure * volume) / kT
+  )
+
+
+def _scale_exchange_variable(value, scale):
+  # Keep the MD state's precision if the ladder uses a different dtype.
+  return tree_map(lambda x: x * jnp.asarray(scale, dtype=x.dtype), value)
+
+
+@functools.singledispatch
+def rescale_temperature(state, kT, new_kT, **kwargs):
+  """Transform kinetic variables after exchanging thermal ensemble labels.
+
+  Particle momenta scale by ``sqrt(new_kT / kT)``. NPT CSVR keeps its piston
+  mass fixed, so its piston momentum scales by the square root as well.
+  Positions, boxes, forces, masses, and random keys remain unchanged.
+
+  NPT CSVR also requires ``pressure`` and ``new_pressure`` to account for the
+  instantaneous change in its conserved-quantity bookkeeping. Exchange jumps
+  should be distinguished from integration drift when analyzing invariants.
+  Custom integrators can register their own state transformations.
+  """
+  raise TypeError(f'Unsupported thermal state: {type(state).__name__}')
+
+
+@rescale_temperature.register(NVTLangevinState)
+def _nvt_rescale_temperature(state, kT, new_kT, **kwargs):
+  return state.set(
+    momentum=_scale_exchange_variable(state.momentum, jnp.sqrt(new_kT / kT))
+  )
+
+
+@rescale_temperature.register(NPTCSVRState)
+def _npt_csvr_rescale_temperature(state, kT, new_kT, *, pressure, new_pressure):
+  ratio = new_kT / kT
+  kinetic = kinetic_energy(state) + state.box_momentum**2 / (2 * state.box_mass)
+  volume = quantity.volume(state.position.shape[-1], state.box)
+  jump = (
+    (ratio - 1) * kinetic
+    + (new_pressure - pressure) * volume
+    - (new_kT - kT) * jnp.log(volume)
+  )
+  return state.set(
+    momentum=_scale_exchange_variable(state.momentum, jnp.sqrt(ratio)),
+    box_momentum=_scale_exchange_variable(state.box_momentum, jnp.sqrt(ratio)),
+    conserved_quantity=state.conserved_quantity + jump,
+  )
+
+
 """Experimental Simulations.
 
 
@@ -2101,7 +2183,8 @@ def temp_csvr(
     return state
 
   def apply_fn(state, **kwargs):
-    state = csvr_update(state, tau, kT, dt)
+    _kT = kwargs.pop('kT', kT)
+    state = csvr_update(state, tau, _kT, dt)
     state = velocity_verlet(force_fn, shift_fn, dt, state, **kwargs)
     return state
 

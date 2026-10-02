@@ -23,6 +23,8 @@ Helper Functions
 .. autofunction:: nose_hoover_chain
 .. autofunction:: npt_box
 .. autofunction:: sinhx_x
+.. autofunction:: log_probability
+.. autofunction:: rescale_temperature
 
 Testing Functions
 ------------------

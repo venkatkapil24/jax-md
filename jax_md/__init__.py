@@ -16,6 +16,7 @@ from jax_md import space
 from jax_md import energy
 from jax_md import minimize
 from jax_md import simulate
+from jax_md import replica_exchange
 from jax_md import smap
 from jax_md import partition
 from jax_md import elasticity

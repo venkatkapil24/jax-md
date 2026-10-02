@@ -15,6 +15,10 @@
 """Tests for google3.third_party.py.jax_md.simulate."""
 
 import functools
+import io
+from typing import Any
+
+import numpy as onp
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -36,6 +40,7 @@ from jax_md import test_util
 from jax_md import partition
 from jax_md import smap
 from jax_md import dataclasses
+from jax_md import replica_exchange
 from jax_md.util import *
 
 from functools import partial
@@ -1107,6 +1112,338 @@ class SimulateTest(test_util.JAXMDTestCase):
       T_emp = np.mean(np.array(T_list))
       assert np.abs(T_emp - T) < 0.1
       assert state.position.dtype == dtype
+
+
+class ReplicaExchangeTest(test_util.JAXMDTestCase):
+  """Check ensemble weights, state transformations, and complete swap sweeps."""
+
+  @parameterized.product(
+    integrator=['langevin', 'csvr', 'npt_csvr'], dtype=DTYPE
+  )
+  def test_weights_and_temperature_transformation(self, integrator, dtype):
+    """Exchange kinetics reversibly without changing configurations or caches."""
+    R = np.array([[0.2, 0.3, 0.4], [0.6, 0.7, 0.8]], dtype=dtype)
+    E = lambda R, **kwargs: np.sum(R**2)
+    if integrator == 'npt_csvr':
+      _, shift = space.periodic_general(dtype(3.0))
+      init, step = simulate.npt_csvr(E, shift, 0.001, 0.2, 1.0, 1.0, 0.1)
+      state = init(random.PRNGKey(1), R, box=dtype(3.0), box_velocity=0.2)
+      parameters = {'pressure': dtype(0.2)}
+      transform = {'pressure': dtype(0.2), 'new_pressure': dtype(0.7)}
+      volume = quantity.volume(3, state.box)
+      expected = -(E(R) + 0.2 * volume)
+    else:
+      _, shift = space.free()
+      if integrator == 'langevin':
+        init, step = simulate.nvt_langevin(E, shift, 0.001, 1.0)
+      else:
+        init, step = simulate.temp_csvr(E, shift, 0.001, 1.0, 0.1)
+      state = init(random.PRNGKey(1), R)
+      parameters, transform = {}, {}
+      expected = -E(R)
+    weight = jit(
+      lambda s: simulate.log_probability(s, E, dtype(1.0), **parameters)
+    )
+    self.assertAllClose(weight(state), expected)
+    changed = jit(
+      lambda s: simulate.rescale_temperature(
+        s, dtype(1.0), dtype(4.0), **transform
+      )
+    )(state)
+    self.assertAllClose(changed.momentum, 2 * state.momentum)
+    self.assertAllClose(
+      simulate.kinetic_energy(changed), 4 * simulate.kinetic_energy(state)
+    )
+    self.assertAllClose(changed.position, state.position)
+    self.assertAllClose(changed.force, state.force)
+    onp.testing.assert_array_equal(changed.rng, state.rng)
+    self.assertEqual(changed.momentum.dtype, dtype)
+    if integrator == 'npt_csvr':
+      self.assertAllClose(changed.box_momentum, 2 * state.box_momentum)
+      self.assertAllClose(changed.box_mass, state.box_mass)
+      self.assertAllClose(changed.box, state.box)
+      self.assertAllClose(changed.dUdV, state.dUdV)
+      self.assertAllClose(changed.potential_energy, state.potential_energy)
+      kinetic = simulate.kinetic_energy(state) + state.box_momentum**2 / (
+        2 * state.box_mass
+      )
+      self.assertAllClose(
+        changed.conserved_quantity - state.conserved_quantity,
+        3 * kinetic + 0.5 * volume - 3 * np.log(volume),
+      )
+      reverse = {'pressure': dtype(0.7), 'new_pressure': dtype(0.2)}
+    else:
+      reverse = {}
+    restored = simulate.rescale_temperature(
+      changed, dtype(4.0), dtype(1.0), **reverse
+    )
+    for a, b in zip(
+      jax.tree_util.tree_leaves(state), jax.tree_util.tree_leaves(restored)
+    ):
+      if a.dtype == onp.dtype('uint32'):
+        onp.testing.assert_array_equal(a, b)
+      else:
+        self.assertAllClose(a, b, atol=1e-5)
+    advanced = jit(lambda s: step(s, kT=dtype(4.0), **parameters))(changed)
+    self.assertTrue(onp.all(onp.isfinite(advanced.momentum)))
+
+  def test_csvr_dynamic_temperature(self):
+    """The CSVR step must use the supplied replica temperature."""
+    E = lambda R, **kwargs: np.sum(R**2)
+    _, shift = space.free()
+    init, step = simulate.temp_csvr(E, shift, 0.01, 1.0, 0.1)
+    state = init(random.PRNGKey(3), np.ones((2, 3)))
+    self.assertFalse(
+      onp.allclose(step(state, kT=1.0).momentum, step(state, kT=4.0).momentum)
+    )
+
+  @parameterized.parameters(2, 3, 4, 5, 8)
+  def test_pair_rounds(self, count):
+    """Every unordered pair appears once, with no replica repeated in a round."""
+    rounds = onp.asarray(replica_exchange._pair_rounds(count))
+    pairs = set()
+    for row in rounds:
+      self.assertEqual(len(onp.unique(row)), row.size)
+      pairs.update(tuple(sorted(pair)) for pair in row)
+    self.assertEqual(len(pairs), count * (count - 1) // 2)
+    self.assertEqual(rounds.shape[0], count - 1 + count % 2)
+
+  @parameterized.product(
+    count=[2, 3, 4, 5], integrator=['langevin', 'csvr', 'npt_csvr']
+  )
+  def test_stride_and_complete_sweep(self, count, integrator):
+    """Equal ensembles accept all pairs only on exact stride boundaries."""
+    R = np.array([[0.2, 0.3, 0.4], [0.6, 0.7, 0.8]])
+    E = lambda R, **kwargs: np.sum(R**2)
+    temperatures = np.ones(count)
+    pressures = None
+    if integrator == 'npt_csvr':
+      _, shift = space.periodic_general(3.0)
+      init_md, step_md = simulate.npt_csvr(E, shift, 0.001, 0.2, 1.0, 1.0, 0.1)
+      replicas = vmap(lambda key: init_md(key, R, 3.0))(
+        random.split(random.PRNGKey(1), count)
+      )
+      pressures = np.full(count, 0.2)
+    else:
+      _, shift = space.free()
+      if integrator == 'langevin':
+        init_md, step_md = simulate.nvt_langevin(E, shift, 0.001, 1.0)
+      else:
+        init_md, step_md = simulate.temp_csvr(E, shift, 0.001, 1.0, 0.1)
+      replicas = vmap(lambda key: init_md(key, R))(
+        random.split(random.PRNGKey(1), count)
+      )
+    init, step = replica_exchange.replica_exchange(
+      E, step_md, temperatures, pressures, stride=3
+    )
+    initial = init(random.PRNGKey(2), replicas)
+    before = jit(lambda s: lax.fori_loop(0, 2, lambda _, s: step(s), s))(
+      initial
+    )
+    onp.testing.assert_array_equal(before.ensemble_indices, onp.arange(count))
+    onp.testing.assert_array_equal(
+      before.swap_accepts, onp.zeros((count, count))
+    )
+    onp.testing.assert_array_equal(before.rng, initial.rng)
+    expected_md = vmap(
+      lambda md: step_md(
+        md, kT=1.0, **({} if pressures is None else {'pressure': 0.2})
+      )
+    )(before.replicas)
+    after = jit(step)(before)
+    self.assertEqual(int(after.step), 3)
+    onp.testing.assert_array_equal(
+      after.swap_accepts, onp.ones((count, count)) - onp.eye(count)
+    )
+    onp.testing.assert_array_equal(
+      onp.sort(after.ensemble_indices), onp.arange(count)
+    )
+    self.assertAllClose(
+      after.replicas.position, expected_md.position, atol=1e-12
+    )
+    self.assertAllClose(after.replicas.force, expected_md.force, atol=1e-12)
+    again = jit(lambda s: lax.fori_loop(0, 3, lambda _, s: step(s), s))(after)
+    onp.testing.assert_array_equal(
+      again.swap_accepts, 2 * (onp.ones((count, count)) - onp.eye(count))
+    )
+
+  def test_acceptance_sign(self):
+    """A high-energy configuration cannot move into a much colder ensemble."""
+    E = lambda R, **kwargs: np.sum(R**2)
+    _, shift = space.free()
+    init_md, _ = simulate.nvt_langevin(E, shift, 0.01, 1.0)
+    positions = np.array([[[0.0, 0.0, 0.0]], [[100.0, 0.0, 0.0]]])
+    replicas = vmap(init_md)(random.split(random.PRNGKey(1), 2), positions)
+    init, step = replica_exchange.replica_exchange(
+      E, lambda s, **kw: s, [1.0, 2.0], stride=1
+    )
+    result = jit(step)(init(random.PRNGKey(2), replicas))
+    onp.testing.assert_array_equal(result.ensemble_indices, [0, 1])
+    onp.testing.assert_array_equal(result.swap_accepts, onp.zeros((2, 2)))
+    reversed_state = init(random.PRNGKey(2), replicas, ensemble_indices=[1, 0])
+    result = jit(step)(reversed_state)
+    onp.testing.assert_array_equal(result.ensemble_indices, [0, 1])
+    onp.testing.assert_array_equal(result.swap_accepts, [[0, 1], [1, 0]])
+
+  @parameterized.parameters('nvt', 'npt')
+  def test_exchange_preserves_exact_ensemble(self, ensemble):
+    """Exchange exact independent samples and recover analytic ensemble moments."""
+    count, samples, particles = 3, 12000, 2
+    temperatures = np.array([0.8, 1.0, 1.3])
+    pressures = np.array([0.6, 0.8, 1.0]) if ensemble == 'npt' else None
+    keys = random.split(random.PRNGKey(10), 6)
+    momentum = (
+      random.normal(keys[0], (samples, count, particles, 3))
+      * np.sqrt(temperatures)[None, :, None, None]
+    )
+    if ensemble == 'nvt':
+      # U = |q|^2 / 2 has six independent Gaussian configurational degrees.
+      E = lambda R, **kwargs: np.sum(R**2) / 2
+      position = (
+        random.normal(keys[1], momentum.shape)
+        * np.sqrt(temperatures)[None, :, None, None]
+      )
+      replicas = simulate.NVTLangevinState(
+        position,
+        momentum,
+        -position,
+        np.ones((samples, count)),
+        random.split(keys[2], samples * count).reshape(samples, count, 2),
+      )
+    else:
+      # An unconstrained ideal gas has V ~ Gamma(N+1, kT/P).
+      assert pressures is not None
+      E = lambda R, **kwargs: np.zeros((), dtype=R.dtype)
+      volume = (
+        random.gamma(keys[1], particles + 1.0, (samples, count))
+        * temperatures
+        / pressures
+      )
+      position = random.uniform(keys[2], momentum.shape)
+      boxes = volume[:, :, None, None] ** (1 / 3) * np.eye(3)
+      zeros = np.zeros((samples, count))
+      replicas = simulate.NPTCSVRState(
+        position,
+        momentum,
+        np.zeros_like(position),
+        np.ones_like(zeros),
+        boxes,
+        zeros,
+        random.normal(keys[3], zeros.shape) * np.sqrt(temperatures),
+        np.ones_like(zeros),
+        zeros,
+        zeros,
+        random.split(keys[4], samples * count).reshape(samples, count, 2),
+        zeros,
+      )
+    init, step = replica_exchange.replica_exchange(
+      E, lambda s, **kw: s, temperatures, pressures, stride=1
+    )
+    batched = vmap(init)(random.split(keys[5], samples), replicas)
+    result = jit(vmap(step))(batched)
+    order = np.argsort(result.ensemble_indices, axis=1)
+    rows = np.arange(samples)[:, None]
+    kinetic = np.sum(result.replicas.momentum**2, axis=(-2, -1)) / 2
+    kinetic = kinetic[rows, order]
+    self.assertAllClose(np.mean(kinetic, axis=0), 3 * temperatures, rtol=0.025)
+    self.assertAllClose(np.var(kinetic, axis=0), 3 * temperatures**2, rtol=0.06)
+    if ensemble == 'nvt':
+      potential = np.sum(result.replicas.position**2, axis=(-2, -1)) / 2
+      potential = potential[rows, order]
+      self.assertAllClose(
+        np.mean(potential, axis=0), 3 * temperatures, rtol=0.025
+      )
+      self.assertAllClose(
+        np.var(potential, axis=0), 3 * temperatures**2, rtol=0.06
+      )
+    else:
+      assert pressures is not None
+      volume = np.linalg.det(result.replicas.reference_box)[rows, order]
+      self.assertAllClose(
+        np.mean(volume, axis=0), 3 * temperatures / pressures, rtol=0.025
+      )
+      self.assertAllClose(
+        np.var(volume, axis=0), 3 * (temperatures / pressures) ** 2, rtol=0.06
+      )
+      piston_kinetic = (result.replicas.box_momentum**2 / 2)[rows, order]
+      self.assertAllClose(
+        np.mean(piston_kinetic, axis=0), temperatures / 2, rtol=0.035
+      )
+      self.assertAllClose(
+        np.var(piston_kinetic, axis=0), temperatures**2 / 2, rtol=0.08
+      )
+
+  def test_index_file_and_sorting(self):
+    """Samples at an exchange step use the mapping written after that exchange."""
+    state = replica_exchange.ReplicaExchangeState(
+      None,
+      np.array([0, 1, 2]),
+      np.array(0),
+      random.PRNGKey(0),
+      np.zeros((3, 3)),
+    )
+    file = io.StringIO()
+    replica_exchange.write_swap_indices(file, state)
+    replica_exchange.write_swap_indices(
+      file, state.set(step=np.array(10), ensemble_indices=np.array([2, 0, 1]))
+    )
+    mappings = onp.loadtxt(io.StringIO(file.getvalue()), dtype=int, ndmin=2)
+    values = onp.arange(4 * 3 * 2).reshape(4, 3, 2)
+    sorted_values = replica_exchange.sort_by_ensemble(
+      [0, 9, 10, 11], values, mappings[:, 0], mappings[:, 1:]
+    )
+    self.assertAllClose(sorted_values[:2], values[:2])
+    self.assertAllClose(sorted_values[2:], values[2:, [1, 2, 0]])
+    with self.assertRaises(ValueError):
+      replica_exchange.sort_by_ensemble([0], values[:1], [1], [[0, 1, 2]])
+    with self.assertRaises(ValueError):
+      replica_exchange.sort_by_ensemble([0], values[:1], [0], [[0, 0, 2]])
+
+  def test_invalid_parameters(self):
+    """Reject malformed ladders and unsupported state types before running MD."""
+    E = lambda R, **kwargs: np.sum(R**2)
+    for temperatures in ([1.0], [0.0, 1.0], [1.0, onp.nan], [[1.0, 2.0]]):
+      with self.assertRaises(ValueError):
+        replica_exchange.replica_exchange(E, lambda s: s, temperatures)
+    invalid_strides: list[Any] = [0, -1, 1.5, True]
+    for stride in invalid_strides:
+      with self.assertRaises(ValueError):
+        replica_exchange.replica_exchange(
+          E, lambda s: s, [1.0, 2.0], stride=stride
+        )
+    for pressures in ([1.0], [1.0, onp.inf]):
+      with self.assertRaises(ValueError):
+        replica_exchange.replica_exchange(
+          E, lambda s: s, [1.0, 2.0], pressure=pressures
+        )
+    _, shift = space.free()
+    init, _ = simulate.nve(E, shift)
+    state = init(random.PRNGKey(1), np.ones((2, 3)), kT=1.0)
+    with self.assertRaises(TypeError):
+      simulate.log_probability(state, E, 1.0)
+    with self.assertRaises(TypeError):
+      simulate.rescale_temperature(state, 1.0, 2.0)
+    init_md, _ = simulate.nvt_langevin(E, shift, 0.01, 1.0)
+    replicas = vmap(lambda key: init_md(key, np.ones((2, 3))))(
+      random.split(random.PRNGKey(1), 2)
+    )
+    init_exchange, step_exchange = replica_exchange.replica_exchange(
+      E, lambda s, **kwargs: s, [1.0, 2.0]
+    )
+    with self.assertRaises(ValueError):
+      init_exchange(random.PRNGKey(2), replicas, ensemble_indices=[0, 0])
+    with self.assertRaises(ValueError):
+      init_exchange(
+        random.PRNGKey(2), jax.tree_util.tree_map(lambda x: x[0], replicas)
+      )
+    init_npt, _ = replica_exchange.replica_exchange(
+      E, lambda s, **kwargs: s, [1.0, 2.0], [0.4, 0.8]
+    )
+    with self.assertRaises(ValueError):
+      init_npt(random.PRNGKey(2), replicas)
+    state = init_exchange(random.PRNGKey(2), replicas)
+    with self.assertRaises(ValueError):
+      step_exchange(state, kT=1.0)
 
 
 if __name__ == '__main__':
