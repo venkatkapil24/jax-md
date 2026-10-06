@@ -23,8 +23,8 @@ Periodic runs can use wrapped positions and existing neighbour lists. Wrapping
 can change the numerical mean of the stored coordinates even when COM momentum
 is zero; it does not represent COM drift. In NPT, the usual box dilation still
 acts on positions: zero COM momentum does not prevent their affine scaling with
-the box. NPT CSVR requires fractional positions. NPT Nose-Hoover's position
-update is unchanged by this option.
+the box. NPT CSVR and NPT Langevin require fractional positions.
+NPT Nose-Hoover's position update is unchanged by this option.
 
 ``simulate.temperature(state)`` automatically uses the constrained kinetic
 degrees of freedom. When using ``quantity.temperature`` directly, pass
@@ -32,13 +32,15 @@ degrees of freedom. When using ``quantity.temperature`` directly, pass
 argument remains unused for compatibility; it does not activate this option.
 Fixed-COM Langevin requires scalar uniform translational friction.
 
-Both barostats retain the standard NPT volume distribution after integrating
+The NPT integrators retain the standard volume distribution after integrating
 out COM, rather than changing finite-system averages by one particle.
 This is a different finite-system convention from i-PI's ``BaroBZP``, which
 retains its ``kT`` piston correction and ``-kT * log(V)`` term with ``fixcom``.
 For NPT CSVR this means ``3 * N - 2`` particle-plus-piston kinetic degrees of
 freedom, a ``2 * kT`` piston correction, and ``-2 * kT * log(V)`` in the
-modified Hamiltonian. For the existing MTK-style Nose-Hoover equations,
+modified Hamiltonian. NPT Langevin uses the same piston and log-volume
+corrections, with projected particle noise and independent piston noise.
+For the existing MTK-style Nose-Hoover equations,
 ``alpha = 1 + d / (d * (N - 1))``, the piston force gains ``d * kT``, and the
 extended invariant gains ``-kT * log(V)``. These corrections account for the
 extra volume weight of the eliminated COM coordinate; see

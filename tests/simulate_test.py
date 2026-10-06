@@ -577,13 +577,15 @@ class SimulateTest(test_util.JAXMDTestCase):
   @parameterized.named_parameters(
     test_util.cases_from_list(
       {
-        'testcase_name': f'_dtype={dtype.__name__}',
+        'testcase_name': f'_dtype={dtype.__name__}_fixed={fixed}',
         'dtype': dtype,
+        'fixed': fixed,
       }
       for dtype in DTYPE
+      for fixed in (False, True)
     )
   )
-  def test_npt_langevin(self, dtype):
+  def test_npt_langevin(self, dtype, fixed):
     particle_count = 64
     box = dtype((particle_count / 0.7) ** (1 / 3))
     grid = np.stack(
@@ -606,10 +608,16 @@ class SimulateTest(test_util.JAXMDTestCase):
       kT=dtype(1.0),
       tau_p=dtype(1.0),
       gamma=dtype(5.0),
+      fix_center_of_mass=fixed,
     )
     apply_fn = jit(apply_fn)
     state = init_fn(random.PRNGKey(0), position, box=box)
-    self.assertFalse(np.allclose(np.sum(state.momentum, axis=0), 0))
+    if fixed:
+      self.assertAllClose(
+        np.sum(state.momentum, axis=0), np.zeros(3, dtype=dtype), atol=1e-5
+      )
+    else:
+      self.assertFalse(np.allclose(np.sum(state.momentum, axis=0), 0))
     initial_box = state.box
     initial_conserved = state.conserved_quantity
 
@@ -641,6 +649,13 @@ class SimulateTest(test_util.JAXMDTestCase):
 
     self.assertEqual(state.position.dtype, dtype)
     self.assertEqual(state.box.dtype, dtype)
+    self.assertAllClose(
+      simulate.temperature(state), 2 * kinetic / (3 * (particle_count - fixed))
+    )
+    if fixed:
+      self.assertAllClose(
+        np.sum(state.momentum, axis=0), np.zeros(3, dtype=dtype), atol=tol
+      )
     self.assertFalse(np.allclose(state.box, initial_box))
     self.assertAllClose(
       state.potential_energy,
@@ -670,13 +685,15 @@ class SimulateTest(test_util.JAXMDTestCase):
   @parameterized.named_parameters(
     test_util.cases_from_list(
       {
-        'testcase_name': f'_dtype={dtype.__name__}',
+        'testcase_name': f'_dtype={dtype.__name__}_fixed={fixed}',
         'dtype': dtype,
+        'fixed': fixed,
       }
       for dtype in DTYPE
+      for fixed in (False, True)
     )
   )
-  def test_npt_langevin_initialization(self, dtype):
+  def test_npt_langevin_initialization(self, dtype, fixed):
     particle_count = 8
     position = (
       np.stack(
@@ -704,6 +721,7 @@ class SimulateTest(test_util.JAXMDTestCase):
         kT=temperature,
         tau_p=tau_p,
         gamma=dtype(5.0),
+        fix_center_of_mass=fixed,
       )
       state = init_fn(
         random.PRNGKey(0),
@@ -716,12 +734,26 @@ class SimulateTest(test_util.JAXMDTestCase):
       expected_box = np.eye(3, dtype=dtype) * box if np.ndim(box) == 0 else box
       expected_box_mass = dtype(3 * particle_count) * temperature * tau_p**2
 
-      self.assertAllClose(state.momentum, momenta)
-      self.assertAllClose(state.velocity, momenta / mass[:, None])
+      expected_momenta = (
+        momenta - mass[:, None] * np.sum(momenta, axis=0) / np.sum(mass)
+        if fixed
+        else momenta
+      )
+      self.assertAllClose(state.position, position, atol=0, rtol=0)
+      self.assertAllClose(state.momentum, expected_momenta)
+      self.assertAllClose(state.velocity, expected_momenta / mass[:, None])
       self.assertAllClose(state.box, expected_box)
       self.assertAllClose(state.box_mass, expected_box_mass)
       self.assertAllClose(state.box_momentum, expected_box_mass * box_velocity)
-      self.assertFalse(np.allclose(np.sum(state.momentum, axis=0), 0))
+      volume = quantity.volume(3, state.box)
+      expected_h = (
+        state.potential_energy
+        + simulate.kinetic_energy(state)
+        + expected_box_mass * box_velocity**2 / 2
+        + dtype(0.4) * volume
+        - (2 if fixed else 1) * temperature * np.log(volume)
+      )
+      self.assertAllClose(state.conserved_quantity, expected_h)
 
   @parameterized.named_parameters(
     test_util.cases_from_list(

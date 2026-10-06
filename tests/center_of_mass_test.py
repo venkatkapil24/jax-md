@@ -53,12 +53,17 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
     )
 
   @parameterized.parameters(
-    'nve', 'nvt_langevin', 'temp_csvr', 'npt_csvr', 'npt_nose_hoover'
+    'nve',
+    'nvt_langevin',
+    'temp_csvr',
+    'npt_csvr',
+    'npt_langevin',
+    'npt_nose_hoover',
   )
   def test_wrapped_neighbor_list(self, integrator):
     """A close pair across the periodic boundary must survive COM initialization."""
     npt = integrator.startswith('npt')
-    fractional = integrator == 'npt_csvr'
+    fractional = integrator in ('npt_csvr', 'npt_langevin')
     R = jnp.array([[9.99, 1.0, 1.0], [0.98, 1.0, 1.0], [4.03, 4.0, 4.0]])
     if fractional:
       R /= 10
@@ -84,6 +89,8 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
       kwargs['pressure'] = 0.1
     if integrator == 'npt_csvr':
       kwargs.update(tau_p=1.0, tau_t=0.1)
+    if integrator == 'npt_langevin':
+      kwargs.update(tau_p=1.0, gamma=5.0)
     # Bind the initial list so force inference need not trace its metadata.
     energy_fn = lambda R, neighbor=neighbor, **kw: E(R, neighbor=neighbor, **kw)
     init, step = getattr(simulate, integrator)(energy_fn, shift, **kwargs)
@@ -178,15 +185,32 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
     )
     self.assertEqual(state.momentum.dtype, dtype)
 
-  @parameterized.product(
-    source=['initialization', 'langevin', 'csvr'], dim=[2, 3]
+  @parameterized.parameters(
+    ('initialization', 2),
+    ('initialization', 3),
+    ('langevin', 2),
+    ('langevin', 3),
+    ('csvr', 2),
+    ('csvr', 3),
+    ('npt_langevin', 3),
   )
   def test_maxwell_distribution(self, source, dim):
     """Check the constrained Maxwell covariance and chi-squared kinetic energy."""
     R = jnp.zeros((4, dim))
     mass = jnp.arange(1, 5, dtype=R.dtype)
     E = lambda R, **kw: jnp.sum(R * 0)
-    if source == 'csvr':
+    if source == 'npt_langevin':
+      init, step = simulate.npt_langevin(
+        E,
+        space.periodic_general(1.0)[1],
+        0.01,
+        1.0,
+        1.0,
+        1.0,
+        gamma=10000.0,
+        fix_center_of_mass=True,
+      )
+    elif source == 'csvr':
       init, step = simulate.temp_csvr(
         E, space.free()[1], 10.0, 1.0, 0.1, fix_center_of_mass=True
       )
@@ -196,7 +220,8 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
       )
 
     def sample(key):
-      state = init(key, R, mass=mass)
+      kwargs = {'box': 1.0} if source == 'npt_langevin' else {}
+      state = init(key, R, mass=mass, **kwargs)
       if source != 'initialization':
         state = step(state)
       return state.momentum, simulate.kinetic_energy(state)
@@ -205,6 +230,9 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
       random.split(random.PRNGKey(2), 20000)
     )
     dof = 3 * dim
+    self.assertAllClose(
+      jnp.sum(momentum, axis=1), jnp.zeros((len(momentum), dim)), atol=1e-6
+    )
     self.assertAllClose(jnp.mean(kinetic), dof / 2, rtol=0.025)
     self.assertAllClose(jnp.var(kinetic), dof / 2, rtol=0.04)
     expected = jnp.diag(mass) - mass[:, None] * mass[None, :] / jnp.sum(mass)
@@ -212,14 +240,14 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
       jnp.cov(momentum[:, :, 0].T), expected, atol=0.07, rtol=0.04
     )
 
-  @parameterized.product(integrator=['csvr', 'nhc'], dtype=DTYPES)
+  @parameterized.product(integrator=['csvr', 'nhc', 'langevin'], dtype=DTYPES)
   def test_npt_invariant(self, integrator, dtype):
     """NPT preserves COM momentum while allowing the usual affine box dilation."""
     R = jnp.array(
       [[0, 0, 0], [1.3, 0, 0], [0, 1.3, 0], [0, 0, 1.3]], dtype=dtype
     )
     box = dtype(5.0)
-    fractional = integrator == 'csvr'
+    fractional = integrator != 'nhc'
     displacement, shift = space.periodic_general(
       box, fractional_coordinates=fractional, wrapped=False
     )
@@ -235,6 +263,18 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
         1.0,
         1.0,
         float('inf'),
+        fix_center_of_mass=True,
+      )
+      invariant = lambda s: s.conserved_quantity
+    elif integrator == 'langevin':
+      init, step = simulate.npt_langevin(
+        E,
+        shift,
+        dtype(0.0002),
+        0.4,
+        1.0,
+        1.0,
+        gamma=0.0,
         fix_center_of_mass=True,
       )
       invariant = lambda s: s.conserved_quantity
@@ -282,17 +322,21 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
     self.assertAllClose(momenta, jnp.zeros_like(momenta), atol=tol, rtol=0)
     self.assertTrue(jnp.all(jnp.isfinite(invariants)))
 
-  @parameterized.parameters('csvr', 'nhc')
+  @parameterized.parameters('csvr', 'nhc', 'langevin')
   def test_npt_ideal_gas(self, integrator):
     """For N=4, standard NPT gives p(V) proportional to V**4 * exp(-V)."""
     R = jnp.zeros((4, 3))
     E = lambda R, **kw: jnp.sum(R * 0)
     _, shift = space.periodic_general(
-      5 ** (1 / 3), fractional_coordinates=integrator == 'csvr', wrapped=False
+      5 ** (1 / 3), fractional_coordinates=integrator != 'nhc', wrapped=False
     )
     if integrator == 'csvr':
       init, step = simulate.npt_csvr(
         E, shift, 0.004, 1.0, 1.0, 0.5, 0.1, fix_center_of_mass=True
+      )
+    elif integrator == 'langevin':
+      init, step = simulate.npt_langevin(
+        E, shift, 0.004, 1.0, 1.0, 0.5, gamma=5.0, fix_center_of_mass=True
       )
     else:
       init, step = simulate.npt_nose_hoover(
@@ -339,17 +383,22 @@ class CenterOfMassTest(test_util.JAXMDTestCase):
     error = np.std(pressure_means, ddof=1) / np.sqrt(len(pressure_means))
     self.assertLess(abs(np.mean(pressure_means) - 1), 6 * error + 0.01)
 
-  def test_nonuniform_langevin_friction_is_rejected(self):
+  @parameterized.parameters('nvt_langevin', 'npt_langevin')
+  def test_nonuniform_langevin_friction_is_rejected(self, integrator):
     E = lambda R, **kw: jnp.sum(R * 0)
-    init, step = simulate.nvt_langevin(
+    kwargs = (
+      {'pressure': 1.0, 'tau_p': 1.0} if integrator == 'npt_langevin' else {}
+    )
+    init, step = getattr(simulate, integrator)(
       E,
-      space.free()[1],
+      space.periodic_general(1.0)[1],
       0.01,
-      1.0,
+      kT=1.0,
       gamma=jnp.ones((4, 1)),
       fix_center_of_mass=True,
+      **kwargs,
     )
-    state = init(random.PRNGKey(0), jnp.zeros((4, 3)))
+    state = init(random.PRNGKey(0), jnp.zeros((4, 3)), box=1.0)
     with self.assertRaisesRegex(ValueError, 'scalar translational friction'):
       step(state)
 

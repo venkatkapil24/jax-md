@@ -1684,15 +1684,14 @@ def npt_csvr(
 
 @dataclasses.dataclass
 class NPTLangevinState:
-  """State information for the unconstrained-COM NPT Langevin integrator.
+  """State information for the isotropic NPT Langevin integrator.
 
   The isotropic box is parameterized by ``box_position`` such that
   ``box_position = log((V / V_0) ** (1 / 3))``. ``box_momentum`` is the
   momentum conjugate to this coordinate and ``box_mass`` is the piston mass.
   ``dUdV`` is the derivative of the potential with respect to an isotropic
   affine perturbation, evaluated at the current state. The state uses the
-  complete particle momentum distribution; no center-of-mass projection is
-  applied.
+  complete particle momentum distribution unless ``fix_center_of_mass=True``.
   """
 
   position: Array
@@ -1708,6 +1707,9 @@ class NPTLangevinState:
   potential_energy: Array
   rng: Array
   conserved_quantity: Array
+  fix_center_of_mass: bool = dataclasses.static_field(
+    default=False, kw_only=True
+  )
 
   @property
   def velocity(self) -> Array:
@@ -1731,12 +1733,13 @@ def npt_langevin(
   kT: ArrayLike,
   tau_p: float,
   gamma: float = 0.1,
+  fix_center_of_mass: bool = False,
 ) -> Simulator:
-  """Simulation in the unconstrained-COM NPT ensemble using Langevin.
+  """Simulation in the isotropic NPT ensemble using Langevin.
 
   This combines the isotropic Bussi-Zykova-Timan-Parrinello NPH propagator
   [#bzp2009]_ with independent Langevin updates of the particle and piston
-  momenta. The particle center of mass and total momentum are unconstrained.
+  momenta. By default the particle COM and total momentum are unconstrained.
 
   ``energy_fn`` must return a scalar potential energy and accept ``box`` and
   ``perturbation`` keyword arguments. ``perturbation=1 + eps`` is used to
@@ -1758,6 +1761,9 @@ def npt_langevin(
     tau_p: The piston relaxation timescale. The piston mass is initialized as
       ``3 * N * kT * tau_p**2``.
     gamma: The Langevin friction coefficient for particles and piston.
+    fix_center_of_mass: Remove COM momentum without recentering positions.
+      Requires uniform scalar friction. The piston thermal correction and
+      log-volume term then use ``2 * kT``, as in fixed-COM NPT CSVR.
 
   Returns:
     An ``(init_fn, apply_fn)`` pair.
@@ -1800,7 +1806,7 @@ def npt_langevin(
       + kinetic
       + piston_kinetic
       + _pressure * volume
-      - _kT * jnp.log(volume)
+      - (2 if fix_center_of_mass else 1) * _kT * jnp.log(volume)
     )
 
   def init_fn(
@@ -1843,6 +1849,7 @@ def npt_langevin(
       potential_energy,
       state_key,
       zero,
+      fix_center_of_mass=fix_center_of_mass,
     )
     state = canonicalize_mass(state)
 
@@ -1853,6 +1860,8 @@ def npt_langevin(
       state = state.set(momentum=momentum)
     else:
       state = canonicalize_momenta(state, momenta)
+
+    state = constrain_center_of_mass(state)
 
     if box_velocity is None:
       box_velocity = jnp.sqrt(_kT / box_mass) * random.normal(
@@ -1878,10 +1887,14 @@ def npt_langevin(
 
   def langevin_update(state, _kT):
     """Apply one exact Langevin half-step to particles and the piston."""
+    if fix_center_of_mass and jnp.ndim(gamma) != 0:
+      raise ValueError(
+        'Fixed-COM Langevin requires scalar translational friction.'
+      )
     next_key, momentum_key, piston_key = random.split(state.rng, 3)
     c = jnp.exp(-gamma * dt_2)
     variance = _kT * (1 - c**2)
-    return state.set(
+    state = state.set(
       momentum=c * state.momentum
       + jnp.sqrt(variance * state.mass)
       * random.normal(momentum_key, state.momentum.shape, state.momentum.dtype),
@@ -1890,13 +1903,15 @@ def npt_langevin(
       * random.normal(piston_key, dtype=state.position.dtype),
       rng=next_key,
     )
+    return constrain_center_of_mass(state)
 
   def piston_half_step(
     eta, momentum, force, mass, dUdV, volume, box_mass, pressure, kT
   ):
     kinetic = quantity.kinetic_energy(momentum=momentum, mass=mass)
     internal_pressure = (2 * kinetic - dUdV) / (3 * volume)
-    eta_dot = 3 * (volume * (internal_pressure - pressure) + kT)
+    correction = (2 if fix_center_of_mass else 1) * kT
+    eta_dot = 3 * (volume * (internal_pressure - pressure) + correction)
     eta = eta + eta_dot * dt_2 / box_mass
     eta += util.high_precision_sum(force * momentum / mass) * dt_2**2 / box_mass
     eta += util.high_precision_sum(force**2 / mass) * dt_2**3 / (3 * box_mass)
@@ -1912,6 +1927,8 @@ def npt_langevin(
       eta, P, F, M, state.dUdV, volume, M_b, _pressure, _kT
     )
     P = P + dt_2 * F
+    if fix_center_of_mass:
+      P = _project_momentum(P, M)
 
     old_H = modified_hamiltonian(
       state.potential_energy,
@@ -1936,6 +1953,8 @@ def npt_langevin(
     volume = quantity.volume(3, box)
     eta = piston_half_step(eta, P, F, M, dUdV, volume, M_b, _pressure, _kT)
     P = P + dt_2 * F
+    if fix_center_of_mass:
+      P = _project_momentum(P, M)
     P_b = M_b * eta
 
     new_H = modified_hamiltonian(
