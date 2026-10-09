@@ -399,6 +399,11 @@ def settle_apply_positions(
   This is a direct port of OpenMM's Reference SETTLE implementation. It operates
   on displacements computed by displacement_fn, so it is compatible with
   wrapped periodic positions (including fractional coordinates).
+
+  Supplied constraint lengths retain their precision. OpenMM 8.6.1 Reference
+  rounds SETTLE lengths to float32 in nm before applying this algorithm; match
+  that preprocessing when comparing projections. Numerical agreement does not
+  imply byte identity across compiled implementations.
   """
   if settle is None or settle.atom1.size == 0:
     return pos_p
