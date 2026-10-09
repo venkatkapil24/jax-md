@@ -442,24 +442,30 @@ def settle_apply_positions(
   b1v = b0 + xp1 - xcom
   c1v = c0 + xp2 - xcom
 
-  # Local orthonormal basis (trns mat) built from original b0/c0
+  # ReferenceSETTLE uses the predicted oxygen relative to the cluster COM
+  # to orient the in-plane axes. Using the old OH direction instead can
+  # select the wrong rotation branch even for an infinitesimal displacement.
   aks_zd = jnp.cross(b0, c0)
-  axlng = jnp.sqrt(jnp.sum(b0 * b0, axis=1))
+  aks_xd = jnp.cross(a1v, aks_zd)
+  aks_yd = jnp.cross(aks_zd, aks_xd)
+  axlng = jnp.sqrt(jnp.sum(aks_xd * aks_xd, axis=1))
+  aylng = jnp.sqrt(jnp.sum(aks_yd * aks_yd, axis=1))
   azlng = jnp.sqrt(jnp.sum(aks_zd * aks_zd, axis=1))
   axlng = jnp.where(axlng > 0, axlng, 1.0)
+  aylng = jnp.where(aylng > 0, aylng, 1.0)
   azlng = jnp.where(azlng > 0, azlng, 1.0)
 
-  trns11 = b0[:, 0] / axlng
-  trns21 = b0[:, 1] / axlng
-  trns31 = b0[:, 2] / axlng
+  trns11 = aks_xd[:, 0] / axlng
+  trns21 = aks_xd[:, 1] / axlng
+  trns31 = aks_xd[:, 2] / axlng
 
   trns13 = aks_zd[:, 0] / azlng
   trns23 = aks_zd[:, 1] / azlng
   trns33 = aks_zd[:, 2] / azlng
 
-  trns12 = trns23 * trns31 - trns33 * trns21
-  trns22 = trns33 * trns11 - trns13 * trns31
-  trns32 = trns13 * trns21 - trns23 * trns11
+  trns12 = aks_yd[:, 0] / aylng
+  trns22 = aks_yd[:, 1] / aylng
+  trns32 = aks_yd[:, 2] / aylng
 
   # Transform selected vectors into the local frame
   def _dot_trns(v):
